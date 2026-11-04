@@ -38,7 +38,7 @@ This service reverse-engineers the legacy portal's authentication, session manag
 
 ## 1. Problem & Overview
 
-Power utilities and field engineering teams rely on internal systems like **Urja Meter Ops** to monitor smart electricity meters, inspect distribution infrastructure, and analyze interval consumption telemetry. However, integrating with the legacy portal presents several engineering challenges:
+Power utilities and field engineering teams rely on internal systems like **Urja Meter Ops** to monitor smart electricity meters, inspect distribution infrastructure, and inspect recent consumption telemetry containing cumulative active and apparent energy registers, along with reported R-phase voltage. However, integrating with the legacy portal presents several engineering challenges:
 
 - **No Public API**: The portal only exposes internal JSON and HTML endpoints designed for its proprietary SvelteKit frontend.
 - **CSRF & Session Validation**: Authentication is session-bound via cookies (`__Secure-better-auth.session_token`). Login requests require specific `Origin` and `Referer` headers to pass upstream origin checks.
@@ -83,7 +83,7 @@ This service acts as an **Anti-Corruption Layer (ACL)** between client applicati
 
 ```mermaid
 graph TD
-    Client[API Consumer / Frontend / Script] -->|HTTP / JSON| ExpressApp[Express REST API Router]
+    Client[API Consumer / Client Application] -->|HTTP / JSON| ExpressApp[Express REST API Router]
     
     subgraph ExpressLayer [Express Application Layer]
         ExpressApp --> MeterController[Meter Controller]
@@ -97,23 +97,30 @@ graph TD
         HierarchyService --> MemoryCache[(In-Memory Hierarchy Cache)]
     end
 
-    subgraph IntegrationLayer [Anti-Corruption Integration Layer]
-        MeterService --> PortalAdapter[Portal Adapter]
-        ConsumptionService --> PortalAdapter
-        HierarchyService --> PortalAdapter
-        PortalAdapter --> PortalClient[Portal HTTP Client]
-        PortalAdapter --> PortalSigner[HMAC-SHA256 Signer]
-        PortalClient --> PortalAuth[Portal Auth Manager]
-        PortalAuth --> CookieJar[(Tough-Cookie Jar)]
+    subgraph Normalization [Domain Normalization]
+        MeterService -.-> PortalAdapter[Portal Adapter]
+        ConsumptionService -.-> PortalAdapter
+        HierarchyService -.-> PortalAdapter
+    end
+
+    subgraph ClientInstances [Independent Portal Client Instances]
+        MeterService --> Client1[PortalClient - Meter]
+        ConsumptionService --> Client2[PortalClient - Consumption]
+        HierarchyService --> Client3[PortalClient - Hierarchy]
+        Client1 --> Auth1[PortalAuthManager]
+        Client2 --> Auth2[PortalAuthManager]
+        Client3 --> Auth3[PortalAuthManager]
+        Client3 --> Signer[PortalSigner - HMAC-SHA256]
     end
 
     subgraph UpstreamPortal [Urja Meter Ops Portal]
-        PortalClient -->|POST /login| UpstreamAuth[Urja Auth Endpoint]
-        PortalClient -->|GET /portal/meters/*| UpstreamMeters[Urja Meters API]
-        PortalClient -->|GET /portal/keys| UpstreamKeys[Urja Key Store]
-        PortalClient -->|GET /portal/export| UpstreamExport[HMAC Signed Export]
+        Client1 -->|POST /login, GET /meters| Upstream[Urja Meter Ops Portal]
+        Client2 -->|POST /login, GET /energy| Upstream
+        Client3 -->|POST /login, GET /keys, GET /export| Upstream
     end
 ```
+
+Each domain service currently owns its portal-client instance and authentication lifecycle. This keeps domain services independently constructible and testable, at the cost of potentially separate login sessions across service instances. A shared application-scoped portal client could be introduced in a larger deployment to centralize session management.
 
 ### 3.2 Request Lifecycle & Transparent Re-Authentication
 
@@ -257,15 +264,34 @@ The project is built on Node.js using TypeScript and standard production librari
 
 2. **Install dependencies**:
    ```bash
-   npm install
+   npm ci
    ```
 
 3. **Configure environment variables**:
-   Copy `.env.example` to `.env` and fill in your Urja portal credentials:
+   Create your local `.env` file from the provided template:
    ```bash
-   cp .env.example .env
+   copy .env.example .env
    ```
-   *(On Windows PowerShell: `Copy-Item .env.example .env`)*
+   *(On Unix/macOS: `cp .env.example .env`)*
+
+   Supply your own authorized portal credentials in `.env`:
+   ```env
+   PORTAL_USERNAME=your_authorized_portal_username
+   PORTAL_PASSWORD=your_authorized_portal_password
+   ```
+
+4. **Start the development server**:
+   ```bash
+   npm run dev
+   ```
+
+5. **Operational verification commands**:
+   ```bash
+   npm run typecheck    # Validate static TypeScript types without emitting code
+   npm run test         # Run complete automated test suite (Vitest)
+   npm run build        # Compile production bundle to dist/
+   npm start            # Run compiled production server from dist/server.js
+   ```
 
 ---
 
@@ -400,7 +426,7 @@ All error responses return `Content-Type: application/problem+json` formatted ac
 - **Endpoint**: `GET /api/v1/meters/:meterId/consumption`
 - **Path Parameters**:
   - `meterId` (string, required): Unique meter identifier.
-- **Description**: Returns chronological telemetry readings (`timestampLocal` ascending). In our investigation, approximately 337 readings (~7 days of half-hourly readings) were observed for sampled meters (this represents an observed investigation snapshot, not a guaranteed count for every meter). Energy values represent cumulative energy registers.
+- **Description**: Returns chronological telemetry readings (`timestampLocal` ascending) containing cumulative active and apparent energy registers along with reported R-phase voltage. In our investigation, approximately 337 readings (~7 days of half-hourly readings) were observed for sampled meters (this represents an observed investigation snapshot, not a permanent guarantee for every meter). Energy values represent cumulative energy registers recorded by the physical meter, not discrete interval consumption. Actual interval consumption would need to be derived from differences between consecutive cumulative readings, subject to meter resets, replacement, rollover, and other operational conditions.
 - **Response**: `200 OK`
   ```json
   {
@@ -520,14 +546,14 @@ The service adheres strictly to the **RFC 7807 Problem Details** specification. 
 
 ```json
 {
-  "type": "urn:urja:error:meter_not_found",
-  "title": "METER NOT FOUND",
+  "type": "urn:urja:error:not_found",
+  "title": "NOT FOUND",
   "status": 404,
   "detail": "Meter with ID \"MTR-NONEXISTENT\" not found",
   "instance": "/api/v1/meters/MTR-NONEXISTENT",
-  "code": "METER_NOT_FOUND",
+  "code": "NOT_FOUND",
   "error": {
-    "code": "METER_NOT_FOUND",
+    "code": "NOT_FOUND",
     "message": "Meter with ID \"MTR-NONEXISTENT\" not found",
     "details": null
   }
@@ -539,9 +565,9 @@ The service adheres strictly to the **RFC 7807 Problem Details** specification. 
 | HTTP Status | RFC 7807 Type | Application Code | Cause |
 |---|---|---|---|
 | `400 Bad Request` | `urn:urja:error:validation_error` | `VALIDATION_ERROR` | Request query parameters or path parameters failed Zod validation. Details contained in `error.details`. |
-| `404 Not Found` | `urn:urja:error:not_found` / `...:meter_not_found` | `NOT_FOUND` / `METER_NOT_FOUND` | The requested meter or route does not exist. |
-| `502 Bad Gateway` | `urn:urja:error:upstream_error` | `UPSTREAM_AUTH_ERROR` / `UPSTREAM_API_ERROR` | The upstream portal returned an authentication failure or schema mismatch. |
-| `504 Gateway Timeout` | `urn:urja:error:upstream_timeout` | `UPSTREAM_TIMEOUT` | Upstream request timed out (`REQUEST_TIMEOUT_MS`). |
+| `404 Not Found` | `urn:urja:error:not_found` | `NOT_FOUND` | The requested meter ID, network hierarchy, or endpoint route was not found. |
+| `502 Bad Gateway` | `urn:urja:error:upstream_service_error` / `urn:urja:error:upstream_auth_error` | `UPSTREAM_SERVICE_ERROR` / `UPSTREAM_AUTH_ERROR` | The upstream portal returned an authentication failure, invalid signing key, or unexpected response schema. |
+| `504 Gateway Timeout` | `urn:urja:error:upstream_timeout` | `UPSTREAM_TIMEOUT` | Upstream portal request timed out (configured via `REQUEST_TIMEOUT_MS`). |
 | `500 Internal Error` | `urn:urja:error:internal_server_error` | `INTERNAL_SERVER_ERROR` | Unhandled internal server exception. |
 
 ---
@@ -549,7 +575,7 @@ The service adheres strictly to the **RFC 7807 Problem Details** specification. 
 ## 13. Engineering Decisions & Trade-offs
 
 ### 1. Direct HTTP Integration vs. Browser Automation
-- **Decision**: Used Playwright exclusively during the initial exploration phase to capture traffic and decrypt client bundles, but implemented 100% direct HTTP calls (`fetch` + `tough-cookie`) for the production service.
+- **Decision**: Used Playwright exploratory automation to capture network traffic, observe authentication flows, and inspect and analyze client-side JavaScript bundles, but implemented 100% direct HTTP integration (`fetch` + `tough-cookie`) for the production service without browser runtime dependencies.
 - **Rationale**: Headless browsers introduce high process-spawning overhead, heavy RAM consumption, and brittle DOM-coupling. Direct HTTP calls communicate directly with the portal's JSON endpoints, ensuring fast response times, predictable resource usage, and clean containerized deployment.
 
 ### 2. In-Memory Hierarchy Caching vs. External Store
@@ -558,7 +584,7 @@ The service adheres strictly to the **RFC 7807 Problem Details** specification. 
 
 ### 3. Date Parsing & Timezone Handling
 - **Decision**: Authored a custom, strictly validated Gregorian calendar parser in [`src/shared/utils/date-parser.ts`](./src/shared/utils/date-parser.ts) that emits unzoned ISO strings (`YYYY-MM-DDTHH:mm:00`), accompanied by `"timestampSemantics": "LOCAL_TIMEZONE_UNCONFIRMED"`.
-- **Rationale**: Upstream timestamps (`DD/MM/YYYY HH:mm`) contain no explicit timezone or UTC offset. While the utility serves Rajasthan (IST, UTC+05:30), appending an unverified timezone offset (`+05:30` or `Z`) could lead to silent data corruption in billing or outage correlation systems. Explicitly preserving local unzoned strings and signaling this in the API contract is the safest engineering decision.
+- **Rationale**: Upstream timestamps (`DD/MM/YYYY HH:mm`) contain no explicit timezone designator. Rather than assuming or fabricating a timezone (such as UTC or an unconfirmed regional offset), the API preserves the source's local-time representation as an unzoned ISO string and explicitly annotates the payload with `"timestampSemantics": "LOCAL_TIMEZONE_UNCONFIRMED"`. This prevents silent data corruption in downstream billing, analytics, or outage correlation engines.
 
 ### 4. Adapter Pattern (Anti-Corruption Layer)
 - **Decision**: All upstream JSON payloads are validated through Zod schemas in [`portal.types.ts`](./src/integrations/urja-portal/portal.types.ts) and normalized through [`portal.adapter.ts`](./src/integrations/urja-portal/portal.adapter.ts) into domain models before reaching business logic.
@@ -573,6 +599,7 @@ The service adheres strictly to the **RFC 7807 Problem Details** specification. 
 3. **Hierarchy Completeness via Bulk Export**: The `/portal/dts` endpoint only exposes transformers and feeders. The full 7-level hierarchy is derived exclusively from the HMAC-signed export dataset.
 4. **Single-Process In-Memory Cache**: The hierarchy cache is held in process memory. In a multi-replica deployment without sticky sessions, each replica maintains its own 5-minute cache.
 5. **Empirical Dataset Snapshot**: The observed total of 403 meters reflects the snapshot state of the portal during investigation rather than a permanent upper limit.
+6. **API Consumer Authentication & Security Boundary**: This assessment implementation does not enforce authentication or authorization for API consumers. It is intended to run locally or within a trusted network for evaluation purposes. Upstream portal credentials (`PORTAL_USERNAME`, `PORTAL_PASSWORD`) are strictly isolated to server-side environment configuration and are never exposed or returned through the API. Before exposing the service in a production or internet-facing environment, consumer authentication, authorization, rate limiting, and appropriate network access controls should be implemented.
 
 ---
 
@@ -643,7 +670,7 @@ A dedicated integration verification script ([`scripts/verify-live-integration.t
 Throughout the reverse-engineering and implementation phases, several key assumptions were established:
 - **Read-Only Boundary**: We assumed the legacy portal must be treated strictly as a read-only system of record, precluding any write or mutating operations.
 - **Cumulative Energy Registers**: We observed that the `kwh` and `kvah` telemetry values from `GET /portal/meters/:id/energy` increased monotonically across the 337 readings (~7 days of half-hourly readings). We assumed these represent cumulative energy registers rather than interval deltas, preserving the raw values while clearly documenting this semantic in the response model.
-- **Local Timezone Unconfirmed**: The legacy portal provides timestamps in the format `DD/MM/YYYY HH:mm` without a timezone offset. Although the utility operates in Rajasthan (IST, UTC+05:30), we assumed that appending an arbitrary timezone offset (`+05:30` or `Z`) could lead to silent data corruption in billing or outage correlation systems. We explicitly chose to preserve unzoned local ISO strings and annotate the payload with `timestampSemantics: "LOCAL_TIMEZONE_UNCONFIRMED"`.
+- **Local Timezone Unconfirmed**: The legacy portal provides timestamps in the format `DD/MM/YYYY HH:mm` without a timezone offset. Because the upstream telemetry does not explicitly supply a timezone designator, we deliberately chose not to assume or fabricate an unconfirmed timezone offset (such as UTC or Indian Standard Time). We explicitly preserved local unzoned ISO strings and annotated the payload with `timestampSemantics: "LOCAL_TIMEZONE_UNCONFIRMED"` to ensure downstream systems handle timezone semantics deliberately.
 - **Hierarchy Completeness via Export**: We verified that while `/portal/dts` contains shallow transformer data, the full 7-level physical hierarchy is comprehensively represented in the bulk `/portal/export` endpoint. We assumed the network graph is relatively static over short windows, making an in-memory 5-minute cache appropriate.
 
 ### 2. What was the hardest part of the assignment, and how did you unblock yourself?
