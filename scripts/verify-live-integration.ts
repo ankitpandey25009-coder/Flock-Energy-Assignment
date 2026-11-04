@@ -120,7 +120,8 @@ async function verifyLiveIntegration() {
 }
 
 verifyLiveIntegration().catch((err: unknown) => {
-  const message = err instanceof Error ? err.message : 'Unknown integration error';
-  console.error(`[LIVE INTEGRATION FAILED] ${message}`);
+  const errorType = err instanceof Error ? err.name : 'UnknownError';
+  console.error(`[LIVE INTEGRATION FAILED] Error type: ${errorType}`);
+  console.error('Details suppressed to avoid exposing sensitive upstream data.');
   process.exit(1);
 });
