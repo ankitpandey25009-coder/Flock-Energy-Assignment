@@ -620,12 +620,13 @@ npm run test
 ```
 
 ### Live Portal Verification Harness
-A dedicated integration verification script ([`scripts/verify-live-integration.ts`](./scripts/verify-live-integration.ts)) tests the entire integration flow against the live Urja portal:
-- Authenticates with real credentials.
-- Queries live meter listings and pagination.
-- Fetches detailed metadata and GIS coordinates for a real meter.
-- Retrieves 337 live consumption readings and verifies chronological ordering.
+A dedicated integration verification script ([`scripts/verify-live-integration.ts`](./scripts/verify-live-integration.ts)) tests the entire integration flow against the live Urja portal using configured environment credentials:
+- Authenticates using configured portal credentials.
+- Queries live meter listings and pagination, discovering a meter dynamically.
+- Verifies detailed attributes and GIS coordinate availability for the dynamically discovered meter.
+- Retrieves live consumption telemetry readings and verifies chronological ordering.
 - Fetches dynamic signing keys and verifies live HMAC-signed export hierarchy resolution.
+- Emits safe Boolean and count indicators without printing actual source identifiers, coordinates, or telemetry data to stdout.
 
 ---
 
